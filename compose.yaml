@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: postgres:18.6
+    container_name: retailpulse-postgres
+
+    environment:
+      POSTGRES_DB: retailpulse
+      POSTGRES_USER: retailpulse_admin
+      POSTGRES_PASSWORD: retailpulse_dev_password
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - retailpulse_postgres_data:/var/lib/postgresql
+      - ./source-system/postgres/init:/docker-entrypoint-initdb.d
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retailpulse_admin -d retailpulse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  retailpulse_postgres_data:
