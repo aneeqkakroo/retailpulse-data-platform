@@ -21,5 +21,22 @@ services:
       timeout: 5s
       retries: 10
 
+  spark:
+    build:
+      context: .
+      dockerfile: docker/spark/Dockerfile
+
+    container_name: retailpulse-spark
+
+    working_dir: /app
+
+    volumes:
+      - .:/app
+
+    environment:
+      JAVA_HOME: /usr/lib/jvm/java-21-openjdk-amd64
+      PYSPARK_PYTHON: /usr/local/bin/python
+      PYSPARK_DRIVER_PYTHON: /usr/local/bin/python
+
 volumes:
   retailpulse_postgres_data:
