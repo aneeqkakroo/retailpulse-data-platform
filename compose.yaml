@@ -16,7 +16,11 @@ services:
       - ./source-system/postgres/init:/docker-entrypoint-initdb.d
 
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U retailpulse_admin -d retailpulse"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U retailpulse_admin -d retailpulse"
+        ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -37,6 +41,22 @@ services:
       JAVA_HOME: /usr/lib/jvm/java-21-openjdk-amd64
       PYSPARK_PYTHON: /usr/local/bin/python
       PYSPARK_DRIVER_PYTHON: /usr/local/bin/python
+
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: retailpulse
+      DB_USER: retailpulse_admin
+      DB_PASSWORD: retailpulse_dev_password
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    command:
+      [
+        "python",
+        "databricks/silver/transform.py"
+      ]
 
 volumes:
   retailpulse_postgres_data:

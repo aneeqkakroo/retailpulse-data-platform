@@ -14,6 +14,8 @@ RUN pip install --no-cache-dir \
     pyspark==4.2.0 \
     delta-spark==4.4.0 \
     "pandas<3" \
-    pyarrow
+    pyarrow \
+    "psycopg[binary]" \
+    python-dotenv
 
 CMD ["python", "databricks/silver/transform.py"]

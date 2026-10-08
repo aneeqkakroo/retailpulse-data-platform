@@ -25,6 +25,20 @@ sys.path.append(
     )
 )
 
+sys.path.append(
+    str(
+        PROJECT_ROOT
+        / "pipeline_utils"
+    )
+)
+
+from audit import (
+    start_pipeline_run,
+    complete_pipeline_run,
+    fail_pipeline_run,
+)
+
+from db import get_connection
 
 from spark_session import get_spark
 from checkpoint import (
@@ -634,14 +648,22 @@ def process_table(
     )
 
     if df.isEmpty():
+
         print(
             f"{table_name}: "
             "no new Bronze records"
         )
 
-        return
+        return {
+            "rows_read": 0,
+            "rows_written": 0,
+            "rows_quarantined": 0,
+            "checkpoint_to": None,
+        }
 
-    incoming_rows = df.count()
+    incoming_rows = (
+        df.count()
+    )
 
     print(
         f"Incoming rows: "
@@ -692,6 +714,7 @@ def process_table(
     )
 
     if valid_count > 0:
+
         merge_delta(
             spark,
             valid,
@@ -700,6 +723,7 @@ def process_table(
         )
 
     if invalid_count > 0:
+
         write_quarantine(
             invalid,
             table_name,
@@ -715,26 +739,188 @@ def process_table(
         f"{max_ingested_at}"
     )
 
+    return {
+        "rows_read": incoming_rows,
+        "rows_written": valid_count,
+        "rows_quarantined": invalid_count,
+        "checkpoint_to": max_ingested_at,
+    }
+
 def main():
     spark = get_spark()
 
+    print()
     print(
-        "\nRetailPulse "
-        "Incremental Silver Delta Pipeline"
+        "RetailPulse Incremental "
+        "Silver Delta Pipeline"
     )
 
-    for table_name in TABLE_CONFIG:
-        process_table(
-            spark,
-            table_name,
-        )
+    try:
 
-    spark.stop()
+        for table_name in TABLE_CONFIG:
 
+            pipeline_name = (
+                f"silver_{table_name}"
+            )
+
+            source_name = (
+                f"bronze/{table_name}"
+            )
+
+            target_name = (
+                f"lakehouse/silver/"
+                f"{table_name}"
+            )
+
+            run_id = None
+
+            previous_checkpoint = (
+                get_checkpoint(
+                    table_name
+                )
+            )
+
+            rows_read = 0
+            rows_written = 0
+            rows_quarantined = 0
+            checkpoint_to = None
+
+            # ----------------------------------------------
+            # Create audit RUNNING record
+            # ----------------------------------------------
+
+            with get_connection() as connection:
+
+                with connection.cursor() as cursor:
+
+                    run_id = start_pipeline_run(
+                        cursor=cursor,
+                        pipeline_name=pipeline_name,
+                        layer="SILVER",
+                        source_name=source_name,
+                        target_name=target_name,
+                    )
+
+                    connection.commit()
+
+            print()
+            print(
+                f"Audit run ID: "
+                f"{run_id}"
+            )
+
+            try:
+
+                metrics = process_table(
+                    spark,
+                    table_name,
+                )
+
+                rows_read = metrics[
+                    "rows_read"
+                ]
+
+                rows_written = metrics[
+                    "rows_written"
+                ]
+
+                rows_quarantined = metrics[
+                    "rows_quarantined"
+                ]
+
+                checkpoint_to = metrics[
+                    "checkpoint_to"
+                ]
+
+                # If there were no new records,
+                # preserve previous checkpoint.
+                if checkpoint_to is None:
+
+                    checkpoint_to = (
+                        previous_checkpoint
+                    )
+
+                # ------------------------------------------
+                # Mark audit SUCCESS
+                # ------------------------------------------
+
+                with get_connection() as connection:
+
+                    with connection.cursor() as cursor:
+
+                        complete_pipeline_run(
+                            cursor=cursor,
+                            run_id=run_id,
+                            rows_read=rows_read,
+                            rows_written=rows_written,
+                            rows_quarantined=(
+                                rows_quarantined
+                            ),
+                            watermark_from=(
+                                previous_checkpoint
+                            ),
+                            watermark_to=(
+                                checkpoint_to
+                            ),
+                        )
+
+                        connection.commit()
+
+            except Exception as error:
+
+                # ------------------------------------------
+                # Mark audit FAILED
+                # ------------------------------------------
+
+                try:
+
+                    with get_connection() as connection:
+
+                        with connection.cursor() as cursor:
+
+                            fail_pipeline_run(
+                                cursor=cursor,
+                                run_id=run_id,
+                                error=error,
+                                rows_read=rows_read,
+                                rows_written=rows_written,
+                                rows_quarantined=(
+                                    rows_quarantined
+                                ),
+                                watermark_from=(
+                                    previous_checkpoint
+                                ),
+                                watermark_to=(
+                                    checkpoint_to
+                                ),
+                            )
+
+                            connection.commit()
+
+                except Exception as audit_error:
+
+                    print(
+                        "WARNING: Silver failure "
+                        "audit could not be saved."
+                    )
+
+                    print(
+                        f"Audit error: "
+                        f"{audit_error}"
+                    )
+
+                raise
+
+    finally:
+
+        spark.stop()
+
+    print()
     print(
-        "\nDelta Silver pipeline completed."
+        "Delta Silver pipeline completed."
     )
 
 
 if __name__ == "__main__":
     main()
+    

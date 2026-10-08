@@ -1,10 +1,40 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
 
 import pandas as pd
 
+
+# ==========================================================
+# PROJECT PATH
+# ==========================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+BRONZE_ROOT = (
+    PROJECT_ROOT
+    / "bronze"
+)
+
+
+# Allow shared pipeline utilities to be imported.
+sys.path.append(
+    str(
+        PROJECT_ROOT
+        / "pipeline_utils"
+    )
+)
+
+
+from audit import (
+    start_pipeline_run,
+    complete_pipeline_run,
+    fail_pipeline_run,
+)
+
 from config import TABLE_CONFIG
 from db import get_connection
+
 from watermark import (
     get_watermark,
     mark_pipeline_failed,
@@ -13,17 +43,16 @@ from watermark import (
 )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-BRONZE_ROOT = PROJECT_ROOT / "bronze"
-
+# ==========================================================
+# TIMESTAMP STANDARDISATION
+# ==========================================================
 
 def standardise_timestamp_columns(df):
     """
-    Enforce consistent timestamp types before writing Parquet.
+    Standardise timestamp columns before writing Parquet.
 
-    PostgreSQL TIMESTAMP columns are treated as timezone-naive
-    timestamps in Bronze. This avoids incompatible Parquet
-    timestamp representations across different ingestion runs.
+    This ensures Bronze Parquet files maintain a consistent
+    physical timestamp representation across ingestion runs.
     """
 
     timestamp_columns = [
@@ -35,7 +64,9 @@ def standardise_timestamp_columns(df):
     ]
 
     for column in timestamp_columns:
+
         if column in df.columns:
+
             df[column] = pd.to_datetime(
                 df[column],
                 errors="coerce",
@@ -44,20 +75,84 @@ def standardise_timestamp_columns(df):
     return df
 
 
+# ==========================================================
+# TABLE EXTRACTION
+# ==========================================================
+
 def extract_table(table_name):
-    config = TABLE_CONFIG[table_name]
 
-    source_table = config["source_table"]
-    watermark_column = config["watermark_column"]
+    config = TABLE_CONFIG[
+        table_name
+    ]
 
-    pipeline_name = f"bronze_{table_name}"
+    source_table = config[
+        "source_table"
+    ]
+
+    watermark_column = config[
+        "watermark_column"
+    ]
+
+    pipeline_name = (
+        f"bronze_{table_name}"
+    )
+
+    target_name = (
+        f"bronze/{table_name}"
+    )
+
+    run_id = None
+
+    previous_watermark = None
+    max_watermark = None
+
+    rows_extracted = 0
+    rows_written = 0
 
     with get_connection() as connection:
+
         with connection.cursor() as cursor:
+
             try:
-                # --------------------------------------------------
-                # Mark pipeline as started
-                # --------------------------------------------------
+
+                # ==================================================
+                # START AUDIT RUN
+                # ==================================================
+
+                run_id = start_pipeline_run(
+                    cursor=cursor,
+                    pipeline_name=pipeline_name,
+                    layer="BRONZE",
+                    source_name=source_table,
+                    target_name=target_name,
+                )
+
+                # Commit immediately so the RUNNING record survives
+                # even if later pipeline processing fails.
+                connection.commit()
+
+                print()
+                print("=" * 70)
+
+                print(
+                    f"Run ID:   {run_id}"
+                )
+
+                print(
+                    f"Pipeline: {pipeline_name}"
+                )
+
+                print(
+                    f"Source:   {source_table}"
+                )
+
+                print(
+                    f"Target:   {target_name}"
+                )
+
+                # ==================================================
+                # MARK WATERMARK PIPELINE START
+                # ==================================================
 
                 mark_pipeline_started(
                     cursor,
@@ -67,30 +162,30 @@ def extract_table(table_name):
 
                 connection.commit()
 
-                # --------------------------------------------------
-                # Retrieve previous watermark
-                # --------------------------------------------------
+                # ==================================================
+                # GET CURRENT WATERMARK
+                # ==================================================
 
-                previous_watermark = get_watermark(
-                    cursor,
-                    pipeline_name,
+                previous_watermark = (
+                    get_watermark(
+                        cursor,
+                        pipeline_name,
+                    )
                 )
 
-                print()
-                print("=" * 60)
-                print(f"Pipeline: {pipeline_name}")
-                print(f"Source:   {source_table}")
                 print(
                     f"Previous watermark: "
                     f"{previous_watermark}"
                 )
-                print("=" * 60)
 
-                # --------------------------------------------------
-                # Build extraction query
-                # --------------------------------------------------
+                print("=" * 70)
+
+                # ==================================================
+                # BUILD EXTRACTION QUERY
+                # ==================================================
 
                 if previous_watermark is None:
+
                     query = f"""
                         SELECT *
                         FROM {source_table}
@@ -104,6 +199,7 @@ def extract_table(table_name):
                     )
 
                 else:
+
                     query = f"""
                         SELECT *
                         FROM {source_table}
@@ -119,9 +215,9 @@ def extract_table(table_name):
                         "Mode: INCREMENTAL LOAD"
                     )
 
-                # --------------------------------------------------
-                # Extract from PostgreSQL
-                # --------------------------------------------------
+                # ==================================================
+                # EXTRACT
+                # ==================================================
 
                 df = pd.read_sql_query(
                     query,
@@ -136,16 +232,27 @@ def extract_table(table_name):
                     f"{rows_extracted:,}"
                 )
 
-                # --------------------------------------------------
-                # Nothing new to process
-                # --------------------------------------------------
+                # ==================================================
+                # NO CHANGES
+                # ==================================================
 
                 if df.empty:
+
                     mark_pipeline_success(
                         cursor,
                         pipeline_name,
                         previous_watermark,
                         0,
+                    )
+
+                    complete_pipeline_run(
+                        cursor=cursor,
+                        run_id=run_id,
+                        rows_read=0,
+                        rows_written=0,
+                        rows_quarantined=0,
+                        watermark_from=previous_watermark,
+                        watermark_to=previous_watermark,
                     )
 
                     connection.commit()
@@ -154,57 +261,76 @@ def extract_table(table_name):
                         "No new or changed rows."
                     )
 
+                    print(
+                        "Pipeline status: SUCCESS"
+                    )
+
                     return
 
-                # --------------------------------------------------
-                # Standardise timestamps
-                # --------------------------------------------------
+                # ==================================================
+                # STANDARDISE TIMESTAMPS
+                # ==================================================
 
-                df = standardise_timestamp_columns(
-                    df
+                df = (
+                    standardise_timestamp_columns(
+                        df
+                    )
                 )
 
-                # --------------------------------------------------
-                # Determine new source watermark
-                # --------------------------------------------------
+                # ==================================================
+                # CALCULATE NEXT WATERMARK
+                # ==================================================
 
                 max_watermark = (
-                    df[watermark_column].max()
+                    df[
+                        watermark_column
+                    ].max()
                 )
 
-                if pd.isna(max_watermark):
+                if pd.isna(
+                    max_watermark
+                ):
                     raise RuntimeError(
-                        f"Unable to determine watermark "
-                        f"for {source_table}"
+                        f"Unable to determine "
+                        f"watermark for "
+                        f"{source_table}"
                     )
 
-                # --------------------------------------------------
-                # Add Bronze technical metadata
-                # --------------------------------------------------
+                # ==================================================
+                # TECHNICAL BRONZE METADATA
+                # ==================================================
 
-                extraction_time = datetime.now(
-                    timezone.utc
-                )
-
-                # Keep ingestion timestamp timezone-naive
-                # for consistent Parquet/Spark handling.
-                ingestion_timestamp = pd.Timestamp(
-                    extraction_time.replace(
-                        tzinfo=None
+                extraction_time = (
+                    datetime.now(
+                        timezone.utc
                     )
                 )
 
-                df["_ingested_at"] = (
-                    ingestion_timestamp
+                ingestion_timestamp = (
+                    pd.Timestamp(
+                        extraction_time.replace(
+                            tzinfo=None
+                        )
+                    )
                 )
 
-                df["_source_table"] = (
-                    source_table
+                df[
+                    "_ingested_at"
+                ] = ingestion_timestamp
+
+                df[
+                    "_source_table"
+                ] = source_table
+
+                df[
+                    "_pipeline_run_id"
+                ] = str(
+                    run_id
                 )
 
-                # --------------------------------------------------
-                # Build partitioned output path
-                # --------------------------------------------------
+                # ==================================================
+                # OUTPUT PATH
+                # ==================================================
 
                 load_date = (
                     extraction_time
@@ -227,7 +353,8 @@ def extract_table(table_name):
                     extraction_time.strftime(
                         "%Y%m%dT%H%M%S%fZ"
                     )
-                    + ".parquet"
+                    +
+                    ".parquet"
                 )
 
                 output_path = (
@@ -235,9 +362,9 @@ def extract_table(table_name):
                     / filename
                 )
 
-                # --------------------------------------------------
-                # Write immutable Bronze Parquet file
-                # --------------------------------------------------
+                # ==================================================
+                # WRITE PARQUET
+                # ==================================================
 
                 df.to_parquet(
                     output_path,
@@ -247,9 +374,13 @@ def extract_table(table_name):
                     allow_truncated_timestamps=True,
                 )
 
-                # --------------------------------------------------
-                # Update watermark only AFTER successful write
-                # --------------------------------------------------
+                rows_written = (
+                    rows_extracted
+                )
+
+                # ==================================================
+                # UPDATE WATERMARK
+                # ==================================================
 
                 mark_pipeline_success(
                     cursor,
@@ -258,15 +389,34 @@ def extract_table(table_name):
                     rows_extracted,
                 )
 
+                # ==================================================
+                # COMPLETE AUDIT
+                # ==================================================
+
+                complete_pipeline_run(
+                    cursor=cursor,
+                    run_id=run_id,
+                    rows_read=rows_extracted,
+                    rows_written=rows_written,
+                    rows_quarantined=0,
+                    watermark_from=previous_watermark,
+                    watermark_to=max_watermark,
+                )
+
                 connection.commit()
 
-                # --------------------------------------------------
-                # Logging
-                # --------------------------------------------------
+                # ==================================================
+                # LOGGING
+                # ==================================================
 
                 print(
                     f"Written to: "
                     f"{output_path}"
+                )
+
+                print(
+                    f"Rows written: "
+                    f"{rows_written:,}"
                 )
 
                 print(
@@ -279,27 +429,53 @@ def extract_table(table_name):
                 )
 
             except Exception as error:
-                # --------------------------------------------------
-                # Roll back previous transaction state
-                # --------------------------------------------------
+
+                # ==================================================
+                # FAILURE HANDLING
+                # ==================================================
 
                 connection.rollback()
 
                 try:
+
                     mark_pipeline_failed(
                         cursor,
                         pipeline_name,
                         error,
                     )
 
+                    if run_id is not None:
+
+                        fail_pipeline_run(
+                            cursor=cursor,
+                            run_id=run_id,
+                            error=error,
+                            rows_read=rows_extracted,
+                            rows_written=rows_written,
+                            rows_quarantined=0,
+                            watermark_from=previous_watermark,
+                            watermark_to=max_watermark,
+                        )
+
                     connection.commit()
 
-                except Exception:
+                except Exception as audit_error:
+
                     connection.rollback()
+
+                    print(
+                        "WARNING: Could not "
+                        "persist failure audit."
+                    )
+
+                    print(
+                        f"Audit error: "
+                        f"{audit_error}"
+                    )
 
                 print()
                 print(
-                    f"Pipeline status: FAILED"
+                    "Pipeline status: FAILED"
                 )
 
                 print(
@@ -309,19 +485,27 @@ def extract_table(table_name):
                 raise
 
 
+# ==========================================================
+# MAIN
+# ==========================================================
+
 def main():
+
     print()
+
     print(
         "RetailPulse Bronze "
         "Incremental Ingestion"
     )
 
     for table_name in TABLE_CONFIG:
+
         extract_table(
             table_name
         )
 
     print()
+
     print(
         "Bronze ingestion completed."
     )

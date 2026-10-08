@@ -20,7 +20,22 @@ sys.path.append(
     )
 )
 
+sys.path.append(
+    str(
+        PROJECT_ROOT
+        / "pipeline_utils"
+    )
+)
+
 from spark_session import get_spark
+
+from audit import (
+    start_pipeline_run,
+    complete_pipeline_run,
+    fail_pipeline_run,
+)
+
+from db import get_connection
 
 
 SILVER_ROOT = (
@@ -68,6 +83,121 @@ def read_silver(
 
 
 # ==========================================================
+# GOLD AUDIT WRAPPER
+# ==========================================================
+
+def run_audited_gold_step(
+    pipeline_name,
+    source_name,
+    target_name,
+    build_function,
+    spark,
+):
+    run_id = None
+
+    rows_read = 0
+    rows_written = 0
+
+    # ------------------------------------------------------
+    # START AUDIT
+    # ------------------------------------------------------
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+
+            run_id = start_pipeline_run(
+                cursor=cursor,
+                pipeline_name=pipeline_name,
+                layer="GOLD",
+                source_name=source_name,
+                target_name=target_name,
+            )
+
+            connection.commit()
+
+    print()
+    print(
+        f"Audit run ID: {run_id}"
+    )
+
+    try:
+
+        metrics = build_function(
+            spark
+        )
+
+        if metrics is not None:
+
+            rows_read = metrics.get(
+                "rows_read",
+                0,
+            )
+
+            rows_written = metrics.get(
+                "rows_written",
+                0,
+            )
+
+        # --------------------------------------------------
+        # SUCCESS AUDIT
+        # --------------------------------------------------
+
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+
+                complete_pipeline_run(
+                    cursor=cursor,
+                    run_id=run_id,
+                    rows_read=rows_read,
+                    rows_written=rows_written,
+                    rows_quarantined=0,
+                    watermark_from=None,
+                    watermark_to=None,
+                )
+
+                connection.commit()
+
+        return metrics
+
+    except Exception as error:
+
+        # --------------------------------------------------
+        # FAILURE AUDIT
+        # --------------------------------------------------
+
+        try:
+
+            with get_connection() as connection:
+                with connection.cursor() as cursor:
+
+                    fail_pipeline_run(
+                        cursor=cursor,
+                        run_id=run_id,
+                        error=error,
+                        rows_read=rows_read,
+                        rows_written=rows_written,
+                        rows_quarantined=0,
+                        watermark_from=None,
+                        watermark_to=None,
+                    )
+
+                    connection.commit()
+
+        except Exception as audit_error:
+
+            print(
+                "WARNING: Gold failure audit "
+                "could not be saved."
+            )
+
+            print(
+                f"Audit error: {audit_error}"
+            )
+
+        raise
+
+
+# ==========================================================
 # DIM CUSTOMER — SCD TYPE 2
 # ==========================================================
 
@@ -80,6 +210,10 @@ def build_dim_customer(spark):
     source = read_silver(
         spark,
         "customers",
+    )
+
+    source_count = (
+        source.count()
     )
 
     tracked_columns = [
@@ -95,7 +229,8 @@ def build_dim_customer(spark):
     ]
 
     # ------------------------------------------------------
-    # Attribute hash used for change detection
+    # ATTRIBUTE HASH
+    # Used to identify customer attribute changes
     # ------------------------------------------------------
 
     source = source.withColumn(
@@ -105,8 +240,14 @@ def build_dim_customer(spark):
                 "||",
                 *[
                     F.coalesce(
-                        F.col(column).cast("string"),
-                        F.lit("<NULL>"),
+                        F.col(
+                            column
+                        ).cast(
+                            "string"
+                        ),
+                        F.lit(
+                            "<NULL>"
+                        ),
                     )
                     for column
                     in tracked_columns
@@ -135,16 +276,17 @@ def build_dim_customer(spark):
         F.lit(
             effective_timestamp
         )
-        .cast("timestamp")
+        .cast(
+            "timestamp"
+        )
     )
 
     # ------------------------------------------------------
     # FIRST LOAD
     # ------------------------------------------------------
     #
-    # On initial creation we use 1900-01-01 so historical
-    # orders from 2023/2024/etc. can resolve to the initial
-    # customer dimension record.
+    # 1900-01-01 allows historical orders to resolve to
+    # the initial customer dimension version.
     # ------------------------------------------------------
 
     if not (
@@ -168,13 +310,17 @@ def build_dim_customer(spark):
             )
             .withColumn(
                 "valid_to",
-                F.lit(None).cast(
+                F.lit(
+                    None
+                ).cast(
                     "timestamp"
                 ),
             )
             .withColumn(
                 "is_current",
-                F.lit(True),
+                F.lit(
+                    True
+                ),
             )
             .withColumn(
                 "customer_sk",
@@ -183,10 +329,14 @@ def build_dim_customer(spark):
                         "||",
                         F.col(
                             "customer_id"
-                        ).cast("string"),
+                        ).cast(
+                            "string"
+                        ),
                         F.col(
                             "valid_from"
-                        ).cast("string"),
+                        ).cast(
+                            "string"
+                        ),
                     ),
                     256,
                 ),
@@ -220,22 +370,38 @@ def build_dim_customer(spark):
             )
         )
 
+        output_count = (
+            initial_output.count()
+        )
+
         (
             initial_output
             .write
-            .format("delta")
-            .mode("overwrite")
+            .format(
+                "delta"
+            )
+            .mode(
+                "overwrite"
+            )
             .save(
-                str(target_path)
+                str(
+                    target_path
+                )
             )
         )
 
         print(
             f"Initial DimCustomer rows: "
-            f"{initial_output.count():,}"
+            f"{output_count:,}"
         )
 
-        return
+        return {
+            "rows_read":
+                source_count,
+
+            "rows_written":
+                output_count,
+        }
 
     # ------------------------------------------------------
     # EXISTING DIMENSION
@@ -243,9 +409,13 @@ def build_dim_customer(spark):
 
     existing = (
         spark.read
-        .format("delta")
+        .format(
+            "delta"
+        )
         .load(
-            str(target_path)
+            str(
+                target_path
+            )
         )
     )
 
@@ -259,6 +429,7 @@ def build_dim_customer(spark):
         )
         .select(
             "customer_id",
+
             F.col(
                 "_attribute_hash"
             ).alias(
@@ -337,7 +508,7 @@ def build_dim_customer(spark):
     )
 
     # ------------------------------------------------------
-    # CLOSE PREVIOUS SCD2 RECORDS
+    # CLOSE OLD CUSTOMER VERSIONS
     # ------------------------------------------------------
 
     if changed_count > 0:
@@ -353,20 +524,23 @@ def build_dim_customer(spark):
         target = (
             DeltaTable.forPath(
                 spark,
-                str(target_path),
+                str(
+                    target_path
+                ),
             )
         )
 
         (
             target
-            .alias("target")
+            .alias(
+                "target"
+            )
             .merge(
                 changed_ids.alias(
                     "source"
                 ),
                 """
-                target.customer_id =
-                    source.customer_id
+                target.customer_id = source.customer_id
                 AND target.is_current = true
                 """,
             )
@@ -376,14 +550,16 @@ def build_dim_customer(spark):
                         effective_literal,
 
                     "is_current":
-                        F.lit(False),
+                        F.lit(
+                            False
+                        ),
                 }
             )
             .execute()
         )
 
     # ------------------------------------------------------
-    # INSERT NEW / CHANGED CUSTOMER VERSIONS
+    # INSERT NEW CUSTOMER VERSIONS
     # ------------------------------------------------------
 
     records_to_insert = (
@@ -407,13 +583,17 @@ def build_dim_customer(spark):
             )
             .withColumn(
                 "valid_to",
-                F.lit(None).cast(
+                F.lit(
+                    None
+                ).cast(
                     "timestamp"
                 ),
             )
             .withColumn(
                 "is_current",
-                F.lit(True),
+                F.lit(
+                    True
+                ),
             )
             .withColumn(
                 "customer_sk",
@@ -422,10 +602,14 @@ def build_dim_customer(spark):
                         "||",
                         F.col(
                             "customer_id"
-                        ).cast("string"),
+                        ).cast(
+                            "string"
+                        ),
                         F.col(
                             "valid_from"
-                        ).cast("string"),
+                        ).cast(
+                            "string"
+                        ),
                     ),
                     256,
                 ),
@@ -458,10 +642,16 @@ def build_dim_customer(spark):
                 *columns
             )
             .write
-            .format("delta")
-            .mode("append")
+            .format(
+                "delta"
+            )
+            .mode(
+                "append"
+            )
             .save(
-                str(target_path)
+                str(
+                    target_path
+                )
             )
         )
 
@@ -469,6 +659,14 @@ def build_dim_customer(spark):
         f"Inserted customer versions: "
         f"{insert_count:,}"
     )
+
+    return {
+        "rows_read":
+            source_count,
+
+        "rows_written":
+            insert_count,
+    }
 
 
 # ==========================================================
@@ -484,6 +682,10 @@ def build_dim_product(spark):
     products = read_silver(
         spark,
         "products",
+    )
+
+    source_count = (
+        products.count()
     )
 
     dim_product = (
@@ -510,11 +712,19 @@ def build_dim_product(spark):
         )
     )
 
+    output_count = (
+        dim_product.count()
+    )
+
     (
         dim_product
         .write
-        .format("delta")
-        .mode("overwrite")
+        .format(
+            "delta"
+        )
+        .mode(
+            "overwrite"
+        )
         .option(
             "overwriteSchema",
             "true",
@@ -528,8 +738,16 @@ def build_dim_product(spark):
 
     print(
         f"DimProduct rows: "
-        f"{dim_product.count():,}"
+        f"{output_count:,}"
     )
+
+    return {
+        "rows_read":
+            source_count,
+
+        "rows_written":
+            output_count,
+    }
 
 
 # ==========================================================
@@ -545,6 +763,10 @@ def build_dim_date(spark):
     orders = read_silver(
         spark,
         "orders",
+    )
+
+    source_count = (
+        orders.count()
     )
 
     min_max = (
@@ -570,11 +792,15 @@ def build_dim_date(spark):
     )
 
     min_date = (
-        min_max["min_date"]
+        min_max[
+            "min_date"
+        ]
     )
 
     max_date = (
-        min_max["max_date"]
+        min_max[
+            "max_date"
+        ]
     )
 
     if (
@@ -678,11 +904,19 @@ def build_dim_date(spark):
         )
     )
 
+    output_count = (
+        dim_date.count()
+    )
+
     (
         dim_date
         .write
-        .format("delta")
-        .mode("overwrite")
+        .format(
+            "delta"
+        )
+        .mode(
+            "overwrite"
+        )
         .option(
             "overwriteSchema",
             "true",
@@ -696,8 +930,16 @@ def build_dim_date(spark):
 
     print(
         f"DimDate rows: "
-        f"{dim_date.count():,}"
+        f"{output_count:,}"
     )
+
+    return {
+        "rows_read":
+            source_count,
+
+        "rows_written":
+            output_count,
+    }
 
 
 # ==========================================================
@@ -724,9 +966,19 @@ def build_fact_sales(spark):
         "order_items",
     )
 
+    orders_count = (
+        orders.count()
+    )
+
+    order_items_count = (
+        order_items.count()
+    )
+
     dim_customer = (
         spark.read
-        .format("delta")
+        .format(
+            "delta"
+        )
         .load(
             gold_path(
                 "dim_customer"
@@ -736,7 +988,9 @@ def build_fact_sales(spark):
 
     dim_product = (
         spark.read
-        .format("delta")
+        .format(
+            "delta"
+        )
         .load(
             gold_path(
                 "dim_product"
@@ -745,7 +999,7 @@ def build_fact_sales(spark):
     )
 
     # ------------------------------------------------------
-    # Count order lines for shipping-cost allocation
+    # ITEM COUNT PER ORDER
     # ------------------------------------------------------
 
     item_counts = (
@@ -871,7 +1125,7 @@ def build_fact_sales(spark):
     )
 
     # ------------------------------------------------------
-    # Add item count
+    # SHIPPING ALLOCATION INPUT
     # ------------------------------------------------------
 
     sales = (
@@ -903,7 +1157,7 @@ def build_fact_sales(spark):
     )
 
     # ------------------------------------------------------
-    # Historical customer dimension lookup
+    # HISTORICAL CUSTOMER LOOKUP
     # ------------------------------------------------------
 
     sales = (
@@ -963,7 +1217,7 @@ def build_fact_sales(spark):
     )
 
     # ------------------------------------------------------
-    # Product dimension lookup
+    # PRODUCT LOOKUP
     # ------------------------------------------------------
 
     sales = (
@@ -1001,7 +1255,7 @@ def build_fact_sales(spark):
     )
 
     # ------------------------------------------------------
-    # Measures
+    # FACT MEASURES
     # ------------------------------------------------------
 
     fact_sales = (
@@ -1031,8 +1285,11 @@ def build_fact_sales(spark):
                     F.col(
                         "items_in_order"
                     ),
-                ).otherwise(
-                    F.lit(0)
+                )
+                .otherwise(
+                    F.lit(
+                        0
+                    )
                 ),
                 2,
             ),
@@ -1097,11 +1354,19 @@ def build_fact_sales(spark):
         )
     )
 
+    output_count = (
+        fact_sales.count()
+    )
+
     (
         fact_sales
         .write
-        .format("delta")
-        .mode("overwrite")
+        .format(
+            "delta"
+        )
+        .mode(
+            "overwrite"
+        )
         .option(
             "overwriteSchema",
             "true",
@@ -1115,8 +1380,18 @@ def build_fact_sales(spark):
 
     print(
         f"FactSales rows: "
-        f"{fact_sales.count():,}"
+        f"{output_count:,}"
     )
+
+    return {
+        "rows_read":
+            orders_count
+            +
+            order_items_count,
+
+        "rows_written":
+            output_count,
+    }
 
 
 # ==========================================================
@@ -1148,9 +1423,23 @@ def build_fact_returns(spark):
         "orders",
     )
 
+    returns_count = (
+        returns.count()
+    )
+
+    order_items_count = (
+        order_items.count()
+    )
+
+    orders_count = (
+        orders.count()
+    )
+
     dim_product = (
         spark.read
-        .format("delta")
+        .format(
+            "delta"
+        )
         .load(
             gold_path(
                 "dim_product"
@@ -1160,7 +1449,9 @@ def build_fact_returns(spark):
 
     dim_customer = (
         spark.read
-        .format("delta")
+        .format(
+            "delta"
+        )
         .load(
             gold_path(
                 "dim_customer"
@@ -1247,7 +1538,7 @@ def build_fact_returns(spark):
     )
 
     # ------------------------------------------------------
-    # Add order information
+    # ADD ORDER INFO
     # ------------------------------------------------------
 
     joined = (
@@ -1285,7 +1576,7 @@ def build_fact_returns(spark):
     )
 
     # ------------------------------------------------------
-    # Product dimension
+    # PRODUCT DIMENSION
     # ------------------------------------------------------
 
     joined = (
@@ -1317,7 +1608,7 @@ def build_fact_returns(spark):
     )
 
     # ------------------------------------------------------
-    # Historical customer dimension
+    # HISTORICAL CUSTOMER DIMENSION
     # ------------------------------------------------------
 
     joined = (
@@ -1377,7 +1668,7 @@ def build_fact_returns(spark):
     )
 
     # ------------------------------------------------------
-    # Build fact
+    # FACT
     # ------------------------------------------------------
 
     fact_returns = (
@@ -1417,11 +1708,19 @@ def build_fact_returns(spark):
         )
     )
 
+    output_count = (
+        fact_returns.count()
+    )
+
     (
         fact_returns
         .write
-        .format("delta")
-        .mode("overwrite")
+        .format(
+            "delta"
+        )
+        .mode(
+            "overwrite"
+        )
         .option(
             "overwriteSchema",
             "true",
@@ -1435,8 +1734,20 @@ def build_fact_returns(spark):
 
     print(
         f"FactReturns rows: "
-        f"{fact_returns.count():,}"
+        f"{output_count:,}"
     )
+
+    return {
+        "rows_read":
+            returns_count
+            +
+            order_items_count
+            +
+            orders_count,
+
+        "rows_written":
+            output_count,
+    }
 
 
 # ==========================================================
@@ -1451,7 +1762,9 @@ def run_gold_quality_checks(spark):
 
     fact_sales = (
         spark.read
-        .format("delta")
+        .format(
+            "delta"
+        )
         .load(
             gold_path(
                 "fact_sales"
@@ -1461,7 +1774,9 @@ def run_gold_quality_checks(spark):
 
     fact_returns = (
         spark.read
-        .format("delta")
+        .format(
+            "delta"
+        )
         .load(
             gold_path(
                 "fact_returns"
@@ -1471,7 +1786,9 @@ def run_gold_quality_checks(spark):
 
     dim_customer = (
         spark.read
-        .format("delta")
+        .format(
+            "delta"
+        )
         .load(
             gold_path(
                 "dim_customer"
@@ -1480,7 +1797,7 @@ def run_gold_quality_checks(spark):
     )
 
     # ------------------------------------------------------
-    # FactSales checks
+    # FACT SALES CHECKS
     # ------------------------------------------------------
 
     missing_customer = (
@@ -1528,7 +1845,7 @@ def run_gold_quality_checks(spark):
     )
 
     # ------------------------------------------------------
-    # FactReturns checks
+    # FACT RETURNS CHECKS
     # ------------------------------------------------------
 
     missing_return_customer = (
@@ -1576,7 +1893,7 @@ def run_gold_quality_checks(spark):
     )
 
     # ------------------------------------------------------
-    # DimCustomer SCD2 checks
+    # SCD2 CHECKS
     # ------------------------------------------------------
 
     multiple_current_customers = (
@@ -1685,18 +2002,16 @@ def run_gold_quality_checks(spark):
 
     if total_issues > 0:
 
-        print()
-        print(
-            "WARNING: Gold quality "
-            "checks detected issues."
+        raise RuntimeError(
+            f"Gold data-quality checks "
+            f"failed with "
+            f"{total_issues} issue(s)."
         )
 
-    else:
-
-        print()
-        print(
-            "Gold quality checks: PASS"
-        )
+    print()
+    print(
+        "Gold quality checks: PASS"
+    )
 
 
 # ==========================================================
@@ -1707,7 +2022,9 @@ def main():
     spark = get_spark()
 
     try:
+
         print()
+
         print(
             "RetailPulse Gold "
             "Dimensional Pipeline"
@@ -1718,38 +2035,125 @@ def main():
             exist_ok=True,
         )
 
-        # Dimensions must be created first
-        build_dim_customer(
-            spark
+        # --------------------------------------------------
+        # DIM CUSTOMER
+        # --------------------------------------------------
+
+        run_audited_gold_step(
+            pipeline_name=(
+                "gold_dim_customer"
+            ),
+            source_name=(
+                "lakehouse/silver/customers"
+            ),
+            target_name=(
+                "lakehouse/gold/dim_customer"
+            ),
+            build_function=(
+                build_dim_customer
+            ),
+            spark=spark,
         )
 
-        build_dim_product(
-            spark
+        # --------------------------------------------------
+        # DIM PRODUCT
+        # --------------------------------------------------
+
+        run_audited_gold_step(
+            pipeline_name=(
+                "gold_dim_product"
+            ),
+            source_name=(
+                "lakehouse/silver/products"
+            ),
+            target_name=(
+                "lakehouse/gold/dim_product"
+            ),
+            build_function=(
+                build_dim_product
+            ),
+            spark=spark,
         )
 
-        build_dim_date(
-            spark
+        # --------------------------------------------------
+        # DIM DATE
+        # --------------------------------------------------
+
+        run_audited_gold_step(
+            pipeline_name=(
+                "gold_dim_date"
+            ),
+            source_name=(
+                "lakehouse/silver/orders"
+            ),
+            target_name=(
+                "lakehouse/gold/dim_date"
+            ),
+            build_function=(
+                build_dim_date
+            ),
+            spark=spark,
         )
 
-        # Facts depend on dimensions
-        build_fact_sales(
-            spark
+        # --------------------------------------------------
+        # FACT SALES
+        # --------------------------------------------------
+
+        run_audited_gold_step(
+            pipeline_name=(
+                "gold_fact_sales"
+            ),
+            source_name=(
+                "silver/orders + "
+                "silver/order_items"
+            ),
+            target_name=(
+                "lakehouse/gold/fact_sales"
+            ),
+            build_function=(
+                build_fact_sales
+            ),
+            spark=spark,
         )
 
-        build_fact_returns(
-            spark
+        # --------------------------------------------------
+        # FACT RETURNS
+        # --------------------------------------------------
+
+        run_audited_gold_step(
+            pipeline_name=(
+                "gold_fact_returns"
+            ),
+            source_name=(
+                "silver/returns + "
+                "silver/order_items + "
+                "silver/orders"
+            ),
+            target_name=(
+                "lakehouse/gold/fact_returns"
+            ),
+            build_function=(
+                build_fact_returns
+            ),
+            spark=spark,
         )
+
+        # --------------------------------------------------
+        # DATA QUALITY
+        # --------------------------------------------------
 
         run_gold_quality_checks(
             spark
         )
 
         print()
+
         print(
             "Gold pipeline completed."
         )
 
     finally:
+
         spark.stop()
 
 
