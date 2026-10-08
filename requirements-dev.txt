@@ -4,3 +4,6 @@ pyspark==4.2.0
 delta-spark==4.4.0
 pandas<3
 pyarrow
+psycopg[binary]
+python-dotenv
+faker
