@@ -6,3 +6,11 @@ bronze/
 silver/
 lakehouse/
 state/silver_checkpoints.json
+
+# Terraform
+.terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log

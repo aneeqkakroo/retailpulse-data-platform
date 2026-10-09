@@ -7,3 +7,5 @@ pyarrow
 psycopg[binary]
 python-dotenv
 faker
+azure-storage-file-datalake
+azure-identity
