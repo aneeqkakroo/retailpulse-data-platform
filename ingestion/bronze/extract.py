@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
+
 import pandas as pd
 
 
@@ -25,7 +26,7 @@ sys.path.append(
     )
 )
 
-
+from adls import upload_file
 from audit import (
     start_pipeline_run,
     complete_pipeline_run,
@@ -372,6 +373,16 @@ def extract_table(table_name):
                     engine="pyarrow",
                     coerce_timestamps="us",
                     allow_truncated_timestamps=True,
+                )
+                relative_path = output_path.relative_to(
+                    PROJECT_ROOT
+                )
+
+                remote_path = relative_path.as_posix()
+
+                upload_file(
+                    local_path=output_path,
+                    remote_path=remote_path,
                 )
 
                 rows_written = (
