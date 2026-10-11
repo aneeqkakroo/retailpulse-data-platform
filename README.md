@@ -254,3 +254,115 @@ RetailPulse demonstrates the full lifecycle of a production-style batch data pla
 - business intelligence
 
 The project is designed to show both engineering depth and business-facing analytics readiness.
+
+## Project Screenshots
+
+### 1. Azure Resources
+
+Azure resources created for the RetailPulse platform.
+
+![Azure Resources](docs/screenshots/01-azure-resources.png)
+
+---
+
+### 2. Azure Data Lake Storage Gen2
+
+ADLS Gen2 container structure used for Bronze, Silver, Gold, Quarantine, and checkpoint data.
+
+![ADLS Layout](docs/screenshots/02-adls-layout1.png)
+
+![ADLS Bronze Layer](docs/screenshots/02-adls-layout2.png)
+
+![ADLS Silver Layer](docs/screenshots/02-adls-layout3.png)
+
+![ADLS Gold Layer](docs/screenshots/02-adls-layout4.png)
+
+![ADLS Quarantine Layer](docs/screenshots/02-adls-layout5.png)
+
+![ADLS Data Files](docs/screenshots/02-adls-layout6.png)
+
+---
+
+### 3. Unity Catalog
+
+RetailPulse catalog and governed schemas registered in Databricks Unity Catalog.
+
+![Unity Catalog](docs/screenshots/03-unity-catalog.png)
+
+---
+
+### 4. Gold Layer Tables
+
+Analytics-ready Gold tables registered in Unity Catalog.
+
+![Gold Tables](docs/screenshots/04-gold-tables.png)
+
+---
+
+### 5. Databricks Workflow
+
+Databricks Jobs orchestrate the Silver incremental pipeline followed by Gold dimensional modelling.
+
+![Databricks Job](docs/screenshots/05-databricks-job.png)
+
+#### Gold Dimensional Task
+
+![Gold Dimensional Job](docs/screenshots/05-databricks-job-Gold.png)
+
+#### Pipeline Execution
+
+![RetailPulse Cloud Pipeline](docs/screenshots/05-databricks-job-Pipeline.png)
+
+#### Silver Incremental Task
+
+![Silver Incremental Job](docs/screenshots/05-databricks-job-Silver_Incremental.png)
+
+---
+
+### 6. Delta Lake MERGE History
+
+Delta Lake transaction history showing incremental `MERGE` operations.
+
+![Delta Merge History](docs/screenshots/06-delta-merge-history.png)
+
+---
+
+### 7. SCD Type 2
+
+Customer dimension history demonstrating Slowly Changing Dimension Type 2 behaviour.
+
+![SCD Type 2 History](docs/screenshots/07-scd2-example.png)
+
+![SCD Type 2 Example](docs/screenshots/07-scd2-example-2.png)
+
+---
+
+### 8. Terraform Infrastructure
+
+Terraform manages the Azure and Databricks infrastructure as code.
+
+![Terraform Plan](docs/screenshots/08-terraform-plan.png)
+
+---
+
+### 9. GitHub Actions CI
+
+Automated CI pipeline running tests and validating code changes.
+
+![GitHub Actions](docs/screenshots/10-github-actions.png)
+
+---
+
+### 10. Power BI Data Model
+
+Star-schema semantic model built from the RetailPulse Gold layer.
+
+![Power BI Data Model](docs/screenshots/11-powerbi-model.png)
+
+---
+
+### 11. Power BI Dashboard
+
+Business-facing dashboard showing sales, margin, returns, customer segments, and product performance.
+
+![Power BI Dashboard](docs/screenshots/12-powerbi-dashboard.png)
